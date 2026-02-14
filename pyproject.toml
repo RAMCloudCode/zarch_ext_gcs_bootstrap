@@ -1,0 +1,9 @@
+[project]
+name = "zarch_ext_gcs_bootstrap"
+version = "0.1.0"
+description = "Z-Arch extension: gcs-bootstrap"
+requires-python = ">=3.11"
+dependencies = ["zarch"]
+
+[project.entry-points."zarch.extensions"]
+gcs-bootstrap = "zarch_ext_gcs_bootstrap:Extension"
