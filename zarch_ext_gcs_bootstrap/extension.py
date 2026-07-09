@@ -15,9 +15,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "retention_days": 30,
     "uniform_bucket_level_access": True,
     "public_access_prevention": True,
+    "cors": None,
 }
 
 ALLOWED_STORAGE_CLASSES = {"STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"}
+ALLOWED_CORS_METHODS = {"DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"}
 BOOL_TRUE_VALUES = {"true", "1", "yes", "y", "on"}
 BOOL_FALSE_VALUES = {"false", "0", "no", "n", "off"}
 
@@ -31,7 +33,7 @@ class Extension(ZArchExtension):
         return extension_block.get("type") == "gcs-bootstrap"
 
 
-    def post_project_bootstrap(
+    async def post_project_bootstrap(
         self,
         project_context,
         extension_configuration: Dict[str, Any],
@@ -40,7 +42,7 @@ class Extension(ZArchExtension):
         bucket_name = settings["bucket_name"]
 
         project_context.log("gcs-bootstrap: enabling required APIs.")
-        self._run_gcloud(
+        await self._run_gcloud(
             project_context,
             ["services", "enable", "storage.googleapis.com", "--quiet"],
             "enable Cloud Storage API",
@@ -49,7 +51,7 @@ class Extension(ZArchExtension):
         project_context.log(
             f"gcs-bootstrap: ensuring bucket '{bucket_name}' exists with expected settings."
         )
-        bucket, created = self._ensure_bucket(project_context, settings)
+        bucket, created = await self._ensure_bucket(project_context, settings)
         if created:
             project_context.log(
                 f"gcs-bootstrap: created bucket '{bucket_name}'.",
@@ -67,7 +69,7 @@ class Extension(ZArchExtension):
                 level="info",
             )
         else:
-            self._update_lifecycle_rule(
+            await self._update_lifecycle_rule(
                 project_context=project_context,
                 bucket_name=str(settings["bucket_name"]),
                 retention_days=int(settings["retention_days"]),
@@ -76,6 +78,24 @@ class Extension(ZArchExtension):
                 "gcs-bootstrap: lifecycle delete rule updated.",
                 level="info",
             )
+
+        cors_rules = settings["cors"]
+        if cors_rules is not None:
+            if self._cors_matches(bucket, cors_rules):
+                project_context.log(
+                    "gcs-bootstrap: CORS configuration already matches.",
+                    level="info",
+                )
+            else:
+                await self._update_cors(
+                    project_context=project_context,
+                    bucket_name=str(settings["bucket_name"]),
+                    cors_rules=cors_rules,
+                )
+                project_context.log(
+                    "gcs-bootstrap: CORS configuration updated.",
+                    level="info",
+                )
 
     def _resolve_settings(
         self,
@@ -126,10 +146,11 @@ class Extension(ZArchExtension):
             merged.get("public_access_prevention"),
             "public_access_prevention",
         )
+        merged["cors"] = self._parse_cors_rules(merged.get("cors"))
 
         return merged
 
-    def _ensure_bucket(
+    async def _ensure_bucket(
         self,
         project_context,
         settings: Mapping[str, Any],
@@ -137,7 +158,7 @@ class Extension(ZArchExtension):
         bucket_name = str(settings["bucket_name"])
         bucket_uri = f"gs://{bucket_name}"
 
-        describe_output, describe_code = self._gcloud_with_project(
+        describe_output, describe_code = await self._gcloud_with_project(
             project_context,
             ["storage", "buckets", "describe", bucket_uri, "--format=json"],
         )
@@ -157,16 +178,16 @@ class Extension(ZArchExtension):
             )
 
         pap_mode = (
-            "--pap"
+            "--public-access-prevention=enforced"
             if bool(settings["public_access_prevention"])
-            else "--no-pap"
+            else "--public-access-prevention=inherited"
         )
         ubla_flag = (
             "--uniform-bucket-level-access"
             if bool(settings["uniform_bucket_level_access"])
             else "--no-uniform-bucket-level-access"
         )
-        self._run_gcloud(
+        await self._run_gcloud(
             project_context,
             [
                 "storage",
@@ -200,29 +221,51 @@ class Extension(ZArchExtension):
             )
 
         expected_storage_class = str(settings["storage_class"]).upper()
-        actual_storage_class = str(bucket.get("storageClass", "")).strip().upper()
+        actual_storage_class = str(
+            bucket.get("storageClass", bucket.get("default_storage_class", ""))
+        ).strip().upper()
         if actual_storage_class and actual_storage_class != expected_storage_class:
             mismatches.append(
                 "storage_class expected="
                 f"{expected_storage_class} actual={actual_storage_class}"
             )
 
+        ubla_enabled = bucket.get("uniform_bucket_level_access")
+        if ubla_enabled is not None:
+            parsed_ubla = self._parse_bool(ubla_enabled, "uniform_bucket_level_access")
+            if parsed_ubla != bool(settings["uniform_bucket_level_access"]):
+                mismatches.append(
+                    "uniform_bucket_level_access expected="
+                    f"{settings['uniform_bucket_level_access']} actual={parsed_ubla}"
+                )
+
+        pap = bucket.get("public_access_prevention")
+        if pap is not None:
+            pap_str = str(pap).strip().lower()
+            parsed_pap = pap_str == "enforced"
+            expected_pap = bool(settings["public_access_prevention"])
+            if parsed_pap != expected_pap:
+                mismatches.append(
+                    "public_access_prevention expected="
+                    f"{expected_pap} actual={pap_str}"
+                )
+
         iam_cfg = bucket.get("iamConfiguration")
         if isinstance(iam_cfg, Mapping):
             ubla = iam_cfg.get("uniformBucketLevelAccess")
             if isinstance(ubla, Mapping):
-                ubla_enabled = ubla.get("enabled")
-                if ubla_enabled is not None:
-                    parsed_ubla = self._parse_bool(ubla_enabled, "uniformBucketLevelAccess.enabled")
+                iam_ubla_enabled = ubla.get("enabled")
+                if iam_ubla_enabled is not None:
+                    parsed_ubla = self._parse_bool(iam_ubla_enabled, "uniformBucketLevelAccess.enabled")
                     if parsed_ubla != bool(settings["uniform_bucket_level_access"]):
                         mismatches.append(
                             "uniform_bucket_level_access expected="
                             f"{settings['uniform_bucket_level_access']} actual={parsed_ubla}"
                         )
 
-            pap = iam_cfg.get("publicAccessPrevention")
-            if pap is not None:
-                pap_str = str(pap).strip().lower()
+            iam_pap = iam_cfg.get("publicAccessPrevention")
+            if iam_pap is not None:
+                pap_str = str(iam_pap).strip().lower()
                 parsed_pap = pap_str == "enforced"
                 expected_pap = bool(settings["public_access_prevention"])
                 if parsed_pap != expected_pap:
@@ -238,7 +281,7 @@ class Extension(ZArchExtension):
             )
 
     def _has_delete_rule(self, bucket: Mapping[str, Any], retention_days: int) -> bool:
-        lifecycle = bucket.get("lifecycle")
+        lifecycle = bucket.get("lifecycle", bucket.get("lifecycle_config"))
         if not isinstance(lifecycle, Mapping):
             return False
         rules = lifecycle.get("rule")
@@ -264,7 +307,56 @@ class Extension(ZArchExtension):
                 return True
         return False
 
-    def _update_lifecycle_rule(
+    def _cors_matches(
+        self,
+        bucket: Mapping[str, Any],
+        expected_cors: list[dict[str, Any]],
+    ) -> bool:
+        existing_cors = bucket.get("cors", bucket.get("cors_config", []))
+        try:
+            normalized_existing = self._parse_cors_rules(existing_cors)
+        except RuntimeError:
+            return False
+        return normalized_existing == expected_cors
+
+    async def _update_cors(
+        self,
+        *,
+        project_context,
+        bucket_name: str,
+        cors_rules: list[dict[str, Any]],
+    ) -> None:
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
+                json.dump(cors_rules, tmp)
+                temp_path = tmp.name
+
+            await self._run_gcloud(
+                project_context,
+                [
+                    "storage",
+                    "buckets",
+                    "update",
+                    f"gs://{bucket_name}",
+                    f"--cors-file={temp_path}",
+                    "--quiet",
+                ],
+                f"update CORS for bucket '{bucket_name}'",
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    async def _update_lifecycle_rule(
         self,
         *,
         project_context,
@@ -291,7 +383,7 @@ class Extension(ZArchExtension):
                 json.dump(rule_payload, tmp)
                 temp_path = tmp.name
 
-            self._run_gcloud(
+            await self._run_gcloud(
                 project_context,
                 [
                     "storage",
@@ -310,17 +402,17 @@ class Extension(ZArchExtension):
                 except FileNotFoundError:
                     pass
 
-    def _run_gcloud(self, project_context, args: list[str], action: str) -> str:
-        output, code = self._gcloud_with_project(project_context, args)
+    async def _run_gcloud(self, project_context, args: list[str], action: str) -> str:
+        output, code = await self._gcloud_with_project(project_context, args)
         if code != 0:
             raise RuntimeError(f"Failed to {action}: {output}")
         return output
 
-    def _gcloud_with_project(self, project_context, args: list[str]) -> tuple[str, int]:
+    async def _gcloud_with_project(self, project_context, args: list[str]) -> tuple[str, int]:
         full_args = list(args)
         if not any(arg == "--project" or arg.startswith("--project=") for arg in full_args):
             full_args.extend(["--project", project_context.id])
-        return project_context.gcloud(full_args)
+        return await project_context.gcloud(full_args)
 
     def _parse_json(self, output: str, source: str) -> Any:
         try:
@@ -346,6 +438,83 @@ class Extension(ZArchExtension):
             return int(value)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Invalid integer for {field_name}: {value!r}") from exc
+
+    def _parse_cors_rules(self, value: Any) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise RuntimeError("cors must be a list of rule objects when provided.")
+
+        rules: list[dict[str, Any]] = []
+        for idx, raw_rule in enumerate(value):
+            if not isinstance(raw_rule, Mapping):
+                raise RuntimeError(f"cors[{idx}] must be an object.")
+
+            origins = self._parse_string_list(
+                raw_rule.get("origins", raw_rule.get("origin")),
+                f"cors[{idx}].origins",
+            )
+            methods = [
+                method.upper()
+                for method in self._parse_string_list(
+                    raw_rule.get("methods", raw_rule.get("method")),
+                    f"cors[{idx}].methods",
+                )
+            ]
+            invalid_methods = sorted(set(methods) - ALLOWED_CORS_METHODS)
+            if invalid_methods:
+                raise RuntimeError(
+                    "Invalid CORS method(s) for cors[{idx}]: {methods}. Expected one of: {allowed}".format(
+                        idx=idx,
+                        methods=", ".join(invalid_methods),
+                        allowed=", ".join(sorted(ALLOWED_CORS_METHODS)),
+                    )
+                )
+
+            response_headers = self._parse_string_list(
+                raw_rule.get("response_headers", raw_rule.get("responseHeader")),
+                f"cors[{idx}].response_headers",
+            )
+            max_age_seconds = self._parse_int(
+                raw_rule.get("max_age_seconds", raw_rule.get("maxAgeSeconds")),
+                f"cors[{idx}].max_age_seconds",
+            )
+            if max_age_seconds < 0:
+                raise RuntimeError(
+                    f"cors[{idx}].max_age_seconds must be >= 0."
+                )
+
+            rules.append(
+                {
+                    "origin": sorted(origins),
+                    "method": sorted(set(methods)),
+                    "responseHeader": sorted(response_headers),
+                    "maxAgeSeconds": max_age_seconds,
+                }
+            )
+
+        return sorted(
+            rules,
+            key=lambda rule: (
+                ",".join(rule["origin"]),
+                ",".join(rule["method"]),
+                ",".join(rule["responseHeader"]),
+                rule["maxAgeSeconds"],
+            ),
+        )
+
+    def _parse_string_list(self, value: Any, field_name: str) -> list[str]:
+        if not isinstance(value, list) or not value:
+            raise RuntimeError(f"{field_name} must be a non-empty list of strings.")
+
+        parsed: list[str] = []
+        for idx, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                raise RuntimeError(
+                    f"{field_name}[{idx}] must be a non-empty string."
+                )
+            parsed.append(item.strip())
+        return parsed
 
     def _is_not_found_error(self, output: str) -> bool:
         lowered = (output or "").lower()

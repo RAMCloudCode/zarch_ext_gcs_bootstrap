@@ -1,4 +1,6 @@
+import asyncio
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,7 @@ class DummyContext:
         self.gcloud_calls = []
         self.logs = []
 
-    def gcloud(self, args):
+    async def gcloud(self, args):
         self.gcloud_calls.append(list(args))
         return self._responder(args)
 
@@ -46,6 +48,35 @@ def test_resolve_settings_parses_and_normalizes_values():
     assert resolved["retention_days"] == 45
     assert resolved["uniform_bucket_level_access"] is True
     assert resolved["public_access_prevention"] is False
+    assert resolved["cors"] is None
+
+
+def test_resolve_settings_parses_and_normalizes_cors_rules():
+    ext = Extension()
+    ctx = DummyContext(region="us-central1")
+    cfg = {
+        "config": {
+            "cors": [
+                {
+                    "origins": ["https://terminal.pvi.systems"],
+                    "methods": ["put", "OPTIONS"],
+                    "response_headers": ["Content-Type"],
+                    "max_age_seconds": "3600",
+                }
+            ]
+        }
+    }
+
+    resolved = ext._resolve_settings(cfg, ctx)
+
+    assert resolved["cors"] == [
+        {
+            "origin": ["https://terminal.pvi.systems"],
+            "method": ["OPTIONS", "PUT"],
+            "responseHeader": ["Content-Type"],
+            "maxAgeSeconds": 3600,
+        }
+    ]
 
 
 def test_resolve_settings_rejects_invalid_storage_class_or_retention():
@@ -59,6 +90,31 @@ def test_resolve_settings_rejects_invalid_storage_class_or_retention():
         ext._resolve_settings({"config": {"retention_days": 0}}, ctx)
 
 
+def test_resolve_settings_rejects_invalid_cors_shape():
+    ext = Extension()
+    ctx = DummyContext()
+
+    with pytest.raises(RuntimeError, match="cors must be a list"):
+        ext._resolve_settings({"config": {"cors": {"origin": ["https://example.com"]}}}, ctx)
+
+    with pytest.raises(RuntimeError, match="Invalid CORS method"):
+        ext._resolve_settings(
+            {
+                "config": {
+                    "cors": [
+                        {
+                            "origins": ["https://example.com"],
+                            "methods": ["TRACE"],
+                            "response_headers": ["Content-Type"],
+                            "max_age_seconds": 3600,
+                        }
+                    ]
+                }
+            },
+            ctx,
+        )
+
+
 def test_bucket_create_command_shape_when_bucket_missing():
     ext = Extension()
     calls = []
@@ -70,7 +126,7 @@ def test_bucket_create_command_shape_when_bucket_missing():
         return ("{}", 0)
 
     ctx = DummyContext(responder=responder)
-    ext.post_project_bootstrap(ctx, {"config": {"bucket_name": "shape-bucket"}})
+    asyncio.run(ext.post_project_bootstrap(ctx, {"config": {"bucket_name": "shape-bucket"}}))
 
     create_calls = [c for c in calls if c[:3] == ["storage", "buckets", "create"]]
     assert len(create_calls) == 1
@@ -99,7 +155,7 @@ def test_lifecycle_update_command_shape_when_rule_missing():
         return ("{}", 0)
 
     ctx = DummyContext(responder=responder)
-    ext.post_project_bootstrap(ctx, {"config": {"bucket_name": "lifecycle-bucket"}})
+    asyncio.run(ext.post_project_bootstrap(ctx, {"config": {"bucket_name": "lifecycle-bucket"}}))
 
     update_calls = [c for c in calls if c[:3] == ["storage", "buckets", "update"]]
     assert len(update_calls) == 1
@@ -109,9 +165,10 @@ def test_lifecycle_update_command_shape_when_rule_missing():
     assert "--project" in update_call
 
 
-def test_idempotency_skips_create_and_update_when_bucket_already_compliant():
+def test_cors_update_command_shape_when_rule_missing():
     ext = Extension()
     calls = []
+    cors_payloads = []
     bucket_json = (
         '{"location":"US-CENTRAL1","storageClass":"STANDARD",'
         '"iamConfiguration":{"uniformBucketLevelAccess":{"enabled":true},'
@@ -123,10 +180,71 @@ def test_idempotency_skips_create_and_update_when_bucket_already_compliant():
         calls.append(list(args))
         if args[:3] == ["storage", "buckets", "describe"]:
             return (bucket_json, 0)
+        if args[:3] == ["storage", "buckets", "update"]:
+            cors_flag = next(
+                (arg for arg in args if arg.startswith("--cors-file=")),
+                None,
+            )
+            if cors_flag:
+                with open(cors_flag.split("=", 1)[1], encoding="utf-8") as fh:
+                    cors_payloads.append(json.load(fh))
+            return ("{}", 0)
         return ("{}", 0)
 
     ctx = DummyContext(responder=responder)
-    ext.post_project_bootstrap(
+    asyncio.run(ext.post_project_bootstrap(
+        ctx,
+        {
+            "config": {
+                "bucket_name": "cors-bucket",
+                "cors": [
+                    {
+                        "origins": ["https://terminal.pvi.systems"],
+                        "methods": ["PUT", "OPTIONS"],
+                        "response_headers": ["Content-Type"],
+                        "max_age_seconds": 3600,
+                    }
+                ],
+            }
+        },
+    ))
+
+    update_calls = [c for c in calls if c[:3] == ["storage", "buckets", "update"]]
+    assert len(update_calls) == 1
+    update_call = update_calls[0]
+    assert update_call[3] == "gs://cors-bucket"
+    assert any(part.startswith("--cors-file=") for part in update_call)
+    assert "--project" in update_call
+    assert cors_payloads == [
+        [
+            {
+                "origin": ["https://terminal.pvi.systems"],
+                "method": ["OPTIONS", "PUT"],
+                "responseHeader": ["Content-Type"],
+                "maxAgeSeconds": 3600,
+            }
+        ]
+    ]
+
+
+def test_idempotency_skips_create_and_update_when_bucket_already_compliant():
+    ext = Extension()
+    calls = []
+    bucket_json = (
+        '{"location":"US-CENTRAL1","default_storage_class":"STANDARD",'
+        '"uniform_bucket_level_access":true,'
+        '"public_access_prevention":"enforced",'
+        '"lifecycle_config":{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]}}'
+    )
+
+    def responder(args):
+        calls.append(list(args))
+        if args[:3] == ["storage", "buckets", "describe"]:
+            return (bucket_json, 0)
+        return ("{}", 0)
+
+    ctx = DummyContext(responder=responder)
+    asyncio.run(ext.post_project_bootstrap(
         ctx,
         {
             "config": {
@@ -134,9 +252,51 @@ def test_idempotency_skips_create_and_update_when_bucket_already_compliant():
                 "retention_days": 30,
             }
         },
-    )
+    ))
 
     create_calls = [c for c in calls if c[:3] == ["storage", "buckets", "create"]]
     update_calls = [c for c in calls if c[:3] == ["storage", "buckets", "update"]]
     assert create_calls == []
+    assert update_calls == []
+
+
+def test_idempotency_skips_cors_update_when_bucket_already_compliant():
+    ext = Extension()
+    calls = []
+    bucket_json = (
+        '{"location":"US-CENTRAL1","default_storage_class":"STANDARD",'
+        '"uniform_bucket_level_access":true,'
+        '"public_access_prevention":"enforced",'
+        '"lifecycle_config":{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]},'
+        '"cors_config":[{"origin":["https://terminal.pvi.systems"],'
+        '"method":["PUT","OPTIONS"],'
+        '"responseHeader":["Content-Type"],'
+        '"maxAgeSeconds":3600}]}'
+    )
+
+    def responder(args):
+        calls.append(list(args))
+        if args[:3] == ["storage", "buckets", "describe"]:
+            return (bucket_json, 0)
+        return ("{}", 0)
+
+    ctx = DummyContext(responder=responder)
+    asyncio.run(ext.post_project_bootstrap(
+        ctx,
+        {
+            "config": {
+                "bucket_name": "idempotent-cors-bucket",
+                "cors": [
+                    {
+                        "origins": ["https://terminal.pvi.systems"],
+                        "methods": ["OPTIONS", "PUT"],
+                        "response_headers": ["Content-Type"],
+                        "max_age_seconds": 3600,
+                    }
+                ],
+            }
+        },
+    ))
+
+    update_calls = [c for c in calls if c[:3] == ["storage", "buckets", "update"]]
     assert update_calls == []
