@@ -58,7 +58,7 @@ def test_resolve_settings_parses_and_normalizes_cors_rules():
         "config": {
             "cors": [
                 {
-                    "origins": ["https://terminal.pvi.systems"],
+                    "origins": ["https://app.example.com"],
                     "methods": ["put", "OPTIONS"],
                     "response_headers": ["Content-Type"],
                     "max_age_seconds": "3600",
@@ -71,7 +71,7 @@ def test_resolve_settings_parses_and_normalizes_cors_rules():
 
     assert resolved["cors"] == [
         {
-            "origin": ["https://terminal.pvi.systems"],
+            "origin": ["https://app.example.com"],
             "method": ["OPTIONS", "PUT"],
             "responseHeader": ["Content-Type"],
             "maxAgeSeconds": 3600,
@@ -139,6 +139,42 @@ def test_bucket_create_command_shape_when_bucket_missing():
     assert "--project" in create_call
 
 
+def test_provisions_each_bucket_in_list_and_enables_api_once():
+    ext = Extension()
+    calls = []
+
+    def responder(args):
+        calls.append(list(args))
+        if args[:3] == ["storage", "buckets", "describe"]:
+            return ("Bucket not found", 1)
+        return ("{}", 0)
+
+    ctx = DummyContext(responder=responder)
+    asyncio.run(ext.post_project_bootstrap(
+        ctx,
+        [
+            {"bucket_name": "example-primary-bucket", "retention_days": 30},
+            {"bucket_name": "example-secondary-bucket", "retention_days": 4},
+        ],
+    ))
+
+    enable_calls = [c for c in calls if c[:2] == ["services", "enable"]]
+    create_calls = [c for c in calls if c[:3] == ["storage", "buckets", "create"]]
+    assert len(enable_calls) == 1
+    assert [call[3] for call in create_calls] == [
+        "gs://example-primary-bucket",
+        "gs://example-secondary-bucket",
+    ]
+
+
+def test_rejects_empty_bucket_list():
+    ext = Extension()
+    ctx = DummyContext()
+
+    with pytest.raises(RuntimeError, match="must contain at least one bucket"):
+        asyncio.run(ext.post_project_bootstrap(ctx, []))
+
+
 def test_lifecycle_update_command_shape_when_rule_missing():
     ext = Extension()
     calls = []
@@ -199,7 +235,7 @@ def test_cors_update_command_shape_when_rule_missing():
                 "bucket_name": "cors-bucket",
                 "cors": [
                     {
-                        "origins": ["https://terminal.pvi.systems"],
+                        "origins": ["https://app.example.com"],
                         "methods": ["PUT", "OPTIONS"],
                         "response_headers": ["Content-Type"],
                         "max_age_seconds": 3600,
@@ -218,7 +254,7 @@ def test_cors_update_command_shape_when_rule_missing():
     assert cors_payloads == [
         [
             {
-                "origin": ["https://terminal.pvi.systems"],
+                "origin": ["https://app.example.com"],
                 "method": ["OPTIONS", "PUT"],
                 "responseHeader": ["Content-Type"],
                 "maxAgeSeconds": 3600,
@@ -268,7 +304,7 @@ def test_idempotency_skips_cors_update_when_bucket_already_compliant():
         '"uniform_bucket_level_access":true,'
         '"public_access_prevention":"enforced",'
         '"lifecycle_config":{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]},'
-        '"cors_config":[{"origin":["https://terminal.pvi.systems"],'
+        '"cors_config":[{"origin":["https://app.example.com"],'
         '"method":["PUT","OPTIONS"],'
         '"responseHeader":["Content-Type"],'
         '"maxAgeSeconds":3600}]}'
@@ -288,7 +324,7 @@ def test_idempotency_skips_cors_update_when_bucket_already_compliant():
                 "bucket_name": "idempotent-cors-bucket",
                 "cors": [
                     {
-                        "origins": ["https://terminal.pvi.systems"],
+                        "origins": ["https://app.example.com"],
                         "methods": ["OPTIONS", "PUT"],
                         "response_headers": ["Content-Type"],
                         "max_age_seconds": 3600,

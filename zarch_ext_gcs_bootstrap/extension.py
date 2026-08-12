@@ -36,10 +36,12 @@ class Extension(ZArchExtension):
     async def post_project_bootstrap(
         self,
         project_context,
-        extension_configuration: Dict[str, Any],
+        extension_configuration: Dict[str, Any] | list[Dict[str, Any]],
     ) -> None:
-        settings = self._resolve_settings(extension_configuration, project_context)
-        bucket_name = settings["bucket_name"]
+        settings_list = self._resolve_configurations(
+            extension_configuration,
+            project_context,
+        )
 
         project_context.log("gcs-bootstrap: enabling required APIs.")
         await self._run_gcloud(
@@ -48,6 +50,15 @@ class Extension(ZArchExtension):
             "enable Cloud Storage API",
         )
 
+        for settings in settings_list:
+            await self._provision_bucket(project_context, settings)
+
+    async def _provision_bucket(
+        self,
+        project_context,
+        settings: Mapping[str, Any],
+    ) -> None:
+        bucket_name = settings["bucket_name"]
         project_context.log(
             f"gcs-bootstrap: ensuring bucket '{bucket_name}' exists with expected settings."
         )
@@ -96,6 +107,32 @@ class Extension(ZArchExtension):
                     "gcs-bootstrap: CORS configuration updated.",
                     level="info",
                 )
+
+    def _resolve_configurations(
+        self,
+        extension_configuration: Mapping[str, Any] | list[Dict[str, Any]],
+        project_context,
+    ) -> list[Dict[str, Any]]:
+        if isinstance(extension_configuration, list):
+            if not extension_configuration:
+                raise RuntimeError(
+                    "gcs-bootstrap config must contain at least one bucket."
+                )
+            configurations = extension_configuration
+        else:
+            configurations = [extension_configuration]
+
+        resolved: list[Dict[str, Any]] = []
+        for index, configuration in enumerate(configurations):
+            try:
+                resolved.append(self._resolve_settings(configuration, project_context))
+            except RuntimeError as exc:
+                if isinstance(extension_configuration, list):
+                    raise RuntimeError(
+                        f"gcs-bootstrap config[{index}]: {exc}"
+                    ) from exc
+                raise
+        return resolved
 
     def _resolve_settings(
         self,
