@@ -15,7 +15,7 @@ application data.
 ```yaml
 extensions:
   gcs-bootstrap:
-    type: "gcs-bootstrap"
+    extension: "gcs-bootstrap"
     required_roles:
       - "roles/storage.admin"
       - "roles/serviceusage.serviceUsageAdmin"
