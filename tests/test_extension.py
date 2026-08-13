@@ -115,7 +115,18 @@ def test_resolve_settings_rejects_invalid_cors_shape():
         )
 
 
-def test_bucket_create_command_shape_when_bucket_missing():
+@pytest.mark.parametrize(
+    ("public_access_prevention", "expected_pap_flag", "unexpected_pap_flag"),
+    [
+        (True, "--public-access-prevention", "--no-public-access-prevention"),
+        (False, "--no-public-access-prevention", "--public-access-prevention"),
+    ],
+)
+def test_bucket_create_command_shape_when_bucket_missing(
+    public_access_prevention,
+    expected_pap_flag,
+    unexpected_pap_flag,
+):
     ext = Extension()
     calls = []
 
@@ -126,7 +137,17 @@ def test_bucket_create_command_shape_when_bucket_missing():
         return ("{}", 0)
 
     ctx = DummyContext(responder=responder)
-    asyncio.run(ext.post_project_bootstrap(ctx, {"config": {"bucket_name": "shape-bucket"}}))
+    asyncio.run(
+        ext.post_project_bootstrap(
+            ctx,
+            {
+                "config": {
+                    "bucket_name": "shape-bucket",
+                    "public_access_prevention": public_access_prevention,
+                }
+            },
+        )
+    )
 
     create_calls = [c for c in calls if c[:3] == ["storage", "buckets", "create"]]
     assert len(create_calls) == 1
@@ -135,7 +156,9 @@ def test_bucket_create_command_shape_when_bucket_missing():
     assert "--location=US-CENTRAL1" in create_call
     assert "--default-storage-class=STANDARD" in create_call
     assert "--uniform-bucket-level-access" in create_call
-    assert "--public-access-prevention=enforced" in create_call
+    assert expected_pap_flag in create_call
+    assert unexpected_pap_flag not in create_call
+    assert not any(arg.startswith("--public-access-prevention=") for arg in create_call)
     assert "--project" in create_call
 
 

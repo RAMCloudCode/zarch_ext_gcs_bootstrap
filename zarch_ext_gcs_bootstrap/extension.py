@@ -210,10 +210,10 @@ class Extension(ZArchExtension):
                 f"Failed to describe bucket '{bucket_name}': {describe_output}"
             )
 
-        pap_mode = (
-            "--public-access-prevention=enforced"
+        pap_flag = (
+            "--public-access-prevention"
             if bool(settings["public_access_prevention"])
-            else "--public-access-prevention=inherited"
+            else "--no-public-access-prevention"
         )
         ubla_flag = (
             "--uniform-bucket-level-access"
@@ -230,7 +230,7 @@ class Extension(ZArchExtension):
                 f"--location={settings['location']}",
                 f"--default-storage-class={settings['storage_class']}",
                 ubla_flag,
-                pap_mode,
+                pap_flag,
                 "--quiet",
             ],
             f"create bucket '{bucket_name}'",
